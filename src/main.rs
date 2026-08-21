@@ -163,7 +163,7 @@ fn draw(frame: &mut Frame, app: &App) {
             app.filter_input
         ),
         Mode::Normal => match &app.filter {
-            None => "  [/] filter   [q] quit".to_string(),
+            None => "  [/] filter   [c] clear   [q] quit".to_string(),
             Some(filter_str) => {
                 let pills: String = filter_str
                     .split(',')
@@ -172,7 +172,7 @@ fn draw(frame: &mut Frame, app: &App) {
                     .map(|t| format!("[{}]", t))
                     .collect::<Vec<_>>()
                     .join(" ");
-                format!("  Filter: {}   [Esc] clear   [/] change   [q] quit", pills)
+                format!("  Filter: {}   [Esc] clear filter   [/] change   [c] clear logs   [q] quit", pills)
             }
         },
     };
@@ -224,6 +224,10 @@ fn run_app(
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
                             return Ok(())
+                        }
+                        KeyCode::Char('c') => {
+                            app.lines.clear();
+                            app.scroll = 0;
                         }
                         KeyCode::Char('/') => {
                             app.mode = Mode::Filtering;
