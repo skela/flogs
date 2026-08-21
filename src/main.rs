@@ -115,11 +115,21 @@ impl App {
     fn filtered_lines(&self) -> Vec<&str> {
         match &self.filter {
             None => self.lines.iter().map(|s| s.as_str()).collect(),
-            Some(tag) => {
-                let target = format!("[{}]", tag).to_ascii_lowercase();
+            Some(filter_str) => {
+                let tags: Vec<String> = filter_str
+                    .split(',')
+                    .map(|t| format!("[{}]", t.trim()).to_ascii_lowercase())
+                    .filter(|t| t.len() > 2)
+                    .collect();
+                if tags.is_empty() {
+                    return self.lines.iter().map(|s| s.as_str()).collect();
+                }
                 self.lines
                     .iter()
-                    .filter(|l| l.to_ascii_lowercase().contains(&target))
+                    .filter(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        tags.iter().any(|tag| lower.contains(tag))
+                    })
                     .map(|s| s.as_str())
                     .collect()
             }
@@ -154,10 +164,16 @@ fn draw(frame: &mut Frame, app: &App) {
         ),
         Mode::Normal => match &app.filter {
             None => "  [/] filter   [q] quit".to_string(),
-            Some(tag) => format!(
-                "  Filter: [{}]   [Esc] clear   [/] change   [q] quit",
-                tag
-            ),
+            Some(filter_str) => {
+                let pills: String = filter_str
+                    .split(',')
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .map(|t| format!("[{}]", t))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("  Filter: {}   [Esc] clear   [/] change   [q] quit", pills)
+            }
         },
     };
     let bar_style = Style::default().bg(Color::DarkGray).fg(Color::White);
