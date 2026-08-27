@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -116,22 +116,64 @@ impl App {
         match &self.filter {
             None => self.lines.iter().map(|s| s.as_str()).collect(),
             Some(filter_str) => {
-                let tags: Vec<String> = filter_str
+                let filters: Vec<String> = filter_str
                     .split(',')
-                    .map(|t| format!("[{}]", t.trim()).to_ascii_lowercase())
-                    .filter(|t| t.len() > 2)
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty())
                     .collect();
-                if tags.is_empty() {
+                if filters.is_empty() {
                     return self.lines.iter().map(|s| s.as_str()).collect();
                 }
-                self.lines
-                    .iter()
-                    .filter(|l| {
-                        let lower = l.to_ascii_lowercase();
-                        tags.iter().any(|tag| lower.contains(tag))
-                    })
-                    .map(|s| s.as_str())
-                    .collect()
+                
+                // Find all matching line indices
+                let mut matching_indices = std::collections::HashSet::new();
+                for (i, line) in self.lines.iter().enumerate() {
+                    let lower = line.to_ascii_lowercase();
+                    if filters.iter().any(|filter| lower.contains(filter)) {
+                        matching_indices.insert(i);
+                    }
+                }
+                
+                // Include context: previous and next lines until we hit a line with a tag
+                let tag_re = regex::Regex::new(r"^\[.+?\]").unwrap();
+                let mut include_indices = std::collections::HashSet::new();
+                
+                for &idx in &matching_indices {
+                    include_indices.insert(idx);
+                    
+                    // Look backwards for related lines (lines without tags)
+                    let mut i = idx;
+                    while i > 0 {
+                        i -= 1;
+                        if tag_re.is_match(&self.lines[i]) {
+                            // Hit a new log entry, don't include it unless it also matches
+                            if matching_indices.contains(&i) {
+                                include_indices.insert(i);
+                            }
+                            break;
+                        }
+                        include_indices.insert(i);
+                    }
+                    
+                    // Look forwards for related lines (lines without tags)
+                    let mut i = idx;
+                    while i < self.lines.len() - 1 {
+                        i += 1;
+                        if tag_re.is_match(&self.lines[i]) {
+                            // Hit a new log entry, don't include it unless it also matches
+                            if matching_indices.contains(&i) {
+                                include_indices.insert(i);
+                            }
+                            break;
+                        }
+                        include_indices.insert(i);
+                    }
+                }
+                
+                // Convert to sorted vec and return the lines
+                let mut indices: Vec<_> = include_indices.into_iter().collect();
+                indices.sort_unstable();
+                indices.iter().map(|&i| self.lines[i].as_str()).collect()
             }
         }
     }
@@ -196,54 +238,70 @@ fn run_app(
         terminal.draw(|f| draw(f, &app))?;
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                match app.mode {
-                    Mode::Filtering => match key.code {
-                        KeyCode::Esc => {
-                            app.mode = Mode::Normal;
-                            app.filter_input.clear();
-                        }
-                        KeyCode::Enter => {
-                            let input = app.filter_input.trim().to_string();
-                            app.filter = if input.is_empty() { None } else { Some(input) };
-                            app.filter_input.clear();
-                            app.mode = Mode::Normal;
-                            app.scroll = 0;
-                        }
-                        KeyCode::Backspace => {
-                            app.filter_input.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.filter_input.push(c);
-                        }
-                        _ => {}
-                    },
-                    Mode::Normal => match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char('c')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            return Ok(())
-                        }
-                        KeyCode::Char('c') => {
-                            app.lines.clear();
-                            app.scroll = 0;
-                        }
-                        KeyCode::Char('/') => {
-                            app.mode = Mode::Filtering;
-                            app.filter_input = app.filter.clone().unwrap_or_default();
-                        }
-                        KeyCode::Esc => {
-                            app.filter = None;
-                            app.scroll = 0;
-                        }
-                        KeyCode::Up => app.scroll += 1,
-                        KeyCode::Down => app.scroll = app.scroll.saturating_sub(1),
-                        KeyCode::PageUp => app.scroll += 20,
-                        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(20),
-                        _ => {}
-                    },
+            match event::read()? {
+                Event::Key(key) => {
+                    match app.mode {
+                        Mode::Filtering => match key.code {
+                            KeyCode::Esc => {
+                                app.mode = Mode::Normal;
+                                app.filter_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                let input = app.filter_input.trim().to_string();
+                                app.filter = if input.is_empty() { None } else { Some(input) };
+                                app.filter_input.clear();
+                                app.mode = Mode::Normal;
+                                app.scroll = 0;
+                            }
+                            KeyCode::Backspace => {
+                                app.filter_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.filter_input.push(c);
+                            }
+                            _ => {}
+                        },
+                        Mode::Normal => match key.code {
+                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                return Ok(())
+                            }
+                            KeyCode::Char('c') => {
+                                app.lines.clear();
+                                app.scroll = 0;
+                            }
+                            KeyCode::Char('/') => {
+                                app.mode = Mode::Filtering;
+                                app.filter_input = app.filter.clone().unwrap_or_default();
+                            }
+                            KeyCode::Esc => {
+                                app.filter = None;
+                                app.scroll = 0;
+                            }
+                            KeyCode::Up => app.scroll += 1,
+                            KeyCode::Down => app.scroll = app.scroll.saturating_sub(1),
+                            KeyCode::PageUp => app.scroll += 20,
+                            KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(20),
+                            _ => {}
+                        },
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    if app.mode == Mode::Normal {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.scroll += 3;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.scroll = app.scroll.saturating_sub(3);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -322,13 +380,13 @@ fn main() {
 
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).unwrap();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).unwrap();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
     let _ = run_app(&mut terminal, rx);
 
     disable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).unwrap();
     terminal.show_cursor().unwrap();
 }
