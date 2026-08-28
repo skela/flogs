@@ -193,9 +193,17 @@ fn draw(frame: &mut Frame, app: &App) {
     let end = total.saturating_sub(scroll);
     let start = end.saturating_sub(visible);
 
+    let max_width = chunks[0].width as usize;
     let items: Vec<ListItem> = filtered[start..end]
         .iter()
-        .map(|l| ListItem::new(*l))
+        .map(|l| {
+            // Truncate lines that are too long to prevent wrapping
+            if l.len() > max_width {
+                ListItem::new(format!("{}…", &l[..max_width.saturating_sub(1)]))
+            } else {
+                ListItem::new(*l)
+            }
+        })
         .collect();
     frame.render_widget(List::new(items), chunks[0]);
 
