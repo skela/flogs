@@ -109,6 +109,102 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Open content in vim via a temp file.
+/// If the text contains a JSON body (anything from the first `{` or `[` after
+/// the log header), it is pretty-printed with `python3 -m json.tool` first.
+/// Returns the formatted text so the caller can restore the TUI after vim exits.
+fn open_in_vim(text: &str) {
+    let (header, json_body) = find_json_split(text);
+
+    let display_text = if let Some(json) = json_body {
+        let pretty = pretty_print_json(json).unwrap_or_else(|| json.to_string());
+        // Comment out every header line with // so the file is valid JSONC
+        let commented_header: String = header
+            .lines()
+            .map(|l| format!("// {}\n", l))
+            .collect();
+        format!("{}{}", commented_header, pretty)
+    } else {
+        // No JSON — comment out all lines so it at least opens as jsonc cleanly
+        text.lines()
+            .map(|l| format!("// {}\n", l))
+            .collect()
+    };
+
+    // Write to a temp file with .jsonc extension for vim filetype detection
+    let tmp_path = "/tmp/flogs_view.jsonc";
+    if let Ok(mut f) = std::fs::File::create(tmp_path) {
+        let _ = f.write_all(display_text.as_bytes());
+    } else {
+        return;
+    }
+
+    // Suspend the TUI
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+
+    // Open vim read-only; set ft=jsonc explicitly in case vim doesn't auto-detect
+    let _ = Command::new("vim")
+        .args(["-R", "+set ft=jsonc", "+set wrap", tmp_path])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+
+    // Restore the TUI
+    let _ = enable_raw_mode();
+    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+}
+
+/// Find the split point between a log header and a JSON body.
+/// Returns (header, Some(json_str)) or (full_text, None).
+fn find_json_split(text: &str) -> (&str, Option<&str>) {
+    // Skip past the leading [TAG] prefix so we don't match the opening bracket
+    // of the tag itself (e.g. "[Http]" starts with '[').
+    let search_from = if text.starts_with('[') {
+        text.find(']').map(|i| i + 1).unwrap_or(0)
+    } else {
+        0
+    };
+
+    for (i, c) in text[search_from..].char_indices() {
+        if c == '{' || c == '[' {
+            let abs = search_from + i;
+            let before = &text[..abs];
+            let trimmed = before.trim_end();
+            // Valid JSON start: preceded by `: ` or a newline, or start of string
+            if trimmed.ends_with(':') || trimmed.ends_with('\n') || abs == 0 {
+                let header = text[..abs]
+                    .trim_end_matches(|c: char| c == ':' || c == ' ');
+                return (header, Some(&text[abs..]));
+            }
+        }
+    }
+    (text, None)
+}
+
+/// Pretty-print JSON using python3. Returns None if python3 isn't available or
+/// the input isn't valid JSON.
+fn pretty_print_json(json: &str) -> Option<String> {
+    let mut child = Command::new("python3")
+        .args(["-m", "json.tool", "--no-ensure-ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(json.as_bytes());
+    }
+    let out = child.wait_with_output().ok()?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).ok()
+    } else {
+        None
+    }
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, PartialEq)]
@@ -209,7 +305,7 @@ impl App {
                     return (0..self.entries.len()).collect();
                 }
 
-                let tag_re = Regex::new(r"^\[.+?\]").unwrap();
+                let tag_re = Regex::new(r"^\[[A-Za-z][A-Za-z0-9 _\-]{0,40}\]").unwrap();
                 let mut matching = std::collections::HashSet::new();
                 for (i, entry) in self.entries.iter().enumerate() {
                     let lower = entry.text.to_ascii_lowercase();
@@ -285,6 +381,13 @@ impl App {
             let text = self.entries[real_idx].text.clone();
             copy_to_clipboard(&text);
             self.copied_msg = Some(("Copied!".to_string(), 12)); // ~0.6s at 50ms tick
+        }
+    }
+
+    fn open_selected(&self) {
+        let indices = self.filtered_indices();
+        if let Some(&real_idx) = indices.get(self.selected) {
+            open_in_vim(&self.entries[real_idx].text);
         }
     }
 }
@@ -454,7 +557,7 @@ fn draw(frame: &mut Frame, app: &App) {
                 };
                 match &app.filter {
                     None => format!(
-                        "  [↑↓] navigate  [Space] expand  [y] copy  [/] filter  [c] clear  [q] quit{}",
+                        "  [↑↓] navigate  [Space] expand  [y] copy  [o] open  [/] filter  [c] clear  [q] quit{}",
                         pos
                     ),
                     Some(filter_str) => {
@@ -466,7 +569,7 @@ fn draw(frame: &mut Frame, app: &App) {
                             .collect::<Vec<_>>()
                             .join(" ");
                         format!(
-                            "  Filter: {}  [Esc] clear  [/] change  [Space] expand  [y] copy  [c] clear logs  [q] quit{}",
+                            "  Filter: {}  [Esc] clear  [/] change  [Space] expand  [y] copy  [o] open  [c] clear logs  [q] quit{}",
                             pills, pos
                         )
                     }
@@ -563,6 +666,12 @@ fn run_app(
                             }
                             KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected(),
                             KeyCode::Char('y') => app.copy_selected(),
+                            KeyCode::Char('o') => {
+                                // Suspend TUI, open in vim, then redraw fully on return
+                                app.open_selected();
+                                // Force a full redraw after vim exits
+                                terminal.clear()?;
+                            }
                             _ => {}
                         },
                     }
@@ -626,21 +735,28 @@ fn main() {
 
         // Strip Android logcat prefix: "I/flutter ( 1234): "
         let prefix_re = Regex::new(r"^I/flutter\s*\(\s*\d+\):\s*").unwrap();
-        // An entry boundary is any line starting with [TAG]
-        let tag_re = Regex::new(r"^\[.+?\]").unwrap();
+        // An entry boundary: line starting with a real log tag like [Http], [Signals], etc.
+        // Deliberately excludes JSON-like content: [{"id":...}] or ["ToggleRFIDAccess"] etc.
+        // Tags are short alphanumeric identifiers, never starting with { " [ or digits.
+        let tag_re = Regex::new(r"^\[[A-Za-z][A-Za-z0-9 _\-]{0,40}\]").unwrap();
+        // Continuation chunk marker emitted by Dart's _printMsg for chunks 2+
+        // "··" = U+00B7 U+00B7 = 4 bytes in UTF-8
+        let cont_prefix = "··";
+        let cont_prefix_len = cont_prefix.len(); // 4 bytes
         // Strip bare ANSI color-only lines (e.g. "\x1b[33;20m" emitted by printLogWarning/Critical)
         let ansi_only_re = Regex::new(r"^\x1b\[[0-9;]*m$").unwrap();
 
         // How long to wait for the next line before flushing a buffered entry.
-        // Dart's _printMsg splits at 800 chars, but all chunks of one logical
-        // message are printed synchronously, so they arrive in rapid succession.
-        // 150 ms is enough to let all chunks arrive while still being responsive.
-        let idle_timeout = Duration::from_millis(150);
+        // Must be long enough to let all ·· continuation chunks arrive after
+        // the final chunk. Dart prints synchronously but logcat/pipe buffering
+        // can introduce delays between lines. 500ms is safe.
+        let idle_timeout = Duration::from_millis(500);
 
         // buffer accumulates the current log entry.
-        // It is always Some once we've seen the first [TAG] line.
-        // We flush it either when the next [TAG] arrives, or after idle_timeout.
+        // last_chunk_was_cont: true if the most recent line was a ·· chunk,
+        // meaning more continuations may still be in flight — don't flush yet.
         let mut buffer: Option<String> = None;
+        let mut last_chunk_was_cont = false;
 
         loop {
             // Wait for the next line, with a timeout so we can flush on idle
@@ -656,9 +772,12 @@ fn main() {
 
             match recv_result {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Idle flush: no new line arrived within the timeout
-                    if let Some(buf) = buffer.take() {
-                        if tx.send(buf).is_err() { break; }
+                    // Idle flush — but only if the last chunk was NOT a ··
+                    // continuation (which would mean more chunks are still coming)
+                    if !last_chunk_was_cont {
+                        if let Some(buf) = buffer.take() {
+                            if tx.send(buf).is_err() { break; }
+                        }
                     }
                     continue;
                 }
@@ -668,6 +787,15 @@ fn main() {
                     break;
                 }
                 Ok(Some(line)) => {
+                    // DEBUG: dump raw lines to /tmp/flogs_raw.log
+                    if std::env::var("FLOGS_DEBUG").is_ok() {
+                        use std::io::Write;
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/flogs_raw.log").unwrap();
+                        writeln!(f, "{:?}", line).unwrap();
+                    }
+
                     // Strip Android prefix
                     let stripped = if prefix_re.is_match(&line) {
                         prefix_re.replace(&line, "").to_string()
@@ -690,13 +818,27 @@ fn main() {
                         }
                         // Always buffer: the entry may have continuation lines
                         buffer = Some(stripped);
+                        last_chunk_was_cont = false;
+                    } else if stripped.starts_with(cont_prefix) {
+                        // Explicit continuation chunk from Dart's _printMsg
+                        let rest = &stripped[cont_prefix_len..];
+                        if let Some(buf) = buffer.as_mut() {
+                            buf.push_str(rest);
+                        } else {
+                            // No buffer (was flushed by timeout mid-entry) —
+                            // start a new buffer with this continuation content
+                            buffer = Some(rest.to_string());
+                        }
+                        last_chunk_was_cont = true;
                     } else if let Some(buf) = buffer.as_mut() {
-                        // Continuation line for the current entry
+                        // Untagged continuation (stack trace, response body line, etc.)
                         buf.push('\n');
                         buf.push_str(&stripped);
+                        last_chunk_was_cont = false;
                     } else {
                         // Pre-tag noise (before the first [TAG] ever seen)
                         if tx.send(stripped).is_err() { break; }
+                        last_chunk_was_cont = false;
                     }
                 }
             }
