@@ -759,6 +759,10 @@ fn main() {
         // the final chunk. Dart prints synchronously but logcat/pipe buffering
         // can introduce delays between lines. 500ms is safe.
         let idle_timeout = Duration::from_millis(500);
+        // After a ·· chunk more may still be in flight, so wait longer — but
+        // still flush eventually, since the final chunk of a long message is
+        // itself a ·· chunk and nothing else may be logged for a while.
+        let cont_idle_timeout = Duration::from_millis(1500);
 
         // buffer accumulates the current log entry.
         // last_chunk_was_cont: true if the most recent line was a ·· chunk,
@@ -769,7 +773,7 @@ fn main() {
         loop {
             // Wait for the next line, with a timeout so we can flush on idle
             let recv_result = if buffer.is_some() {
-                line_rx.recv_timeout(idle_timeout)
+                line_rx.recv_timeout(if last_chunk_was_cont { cont_idle_timeout } else { idle_timeout })
             } else {
                 // No buffer — block indefinitely to avoid busy-spinning
                 match line_rx.recv() {
@@ -780,13 +784,10 @@ fn main() {
 
             match recv_result {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Idle flush — but only if the last chunk was NOT a ··
-                    // continuation (which would mean more chunks are still coming)
-                    if !last_chunk_was_cont {
-                        if let Some(buf) = buffer.take() {
-                            if tx.send(buf).is_err() { break; }
-                        }
+                    if let Some(buf) = buffer.take() {
+                        if tx.send(buf).is_err() { break; }
                     }
+                    last_chunk_was_cont = false;
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
