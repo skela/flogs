@@ -492,7 +492,11 @@ fn draw(frame: &mut Frame, app: &App) {
             // Single row, truncate
             let first_line = entry.text.lines().next().unwrap_or("");
             let truncated = if first_line.len() > usable_width {
-                format!("{}{}…", prefix, &first_line[..usable_width.saturating_sub(1)])
+                let mut end = usable_width.saturating_sub(1);
+                while !first_line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}{}…", prefix, &first_line[..end])
             } else {
                 format!("{}{}", prefix, first_line)
             };
@@ -711,6 +715,10 @@ fn main() {
     thread::spawn(move || {
         let mut child = Command::new("flutter")
             .args(&flutter_args)
+            // Keep flutter (a Dart process) away from the TTY: the Dart VM saves
+            // the terminal mode at startup and restores it on exit, which can
+            // silently turn raw mode off underneath the TUI.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -851,6 +859,13 @@ fn main() {
         let _ = child.kill();
         let _ = child.wait();
     });
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        default_hook(info);
+    }));
 
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
